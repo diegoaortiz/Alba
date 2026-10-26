@@ -44,7 +44,7 @@
 #define TFT_BL 12
 
 #define LED_PIN 22
-#define LED_COUNT 24
+#define LED_COUNT 64
 #define LED_BRIGHTNESS 90
 
 // MH-Z19 on GP6 / GP7. These pins are NOT on a hardware UART, so we drive a
