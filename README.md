@@ -43,6 +43,16 @@ Capteur CO2 connecté « **alba** » : affichage animé (anneaux concentriques q
 
 > L'affichage est rendu avec **LVGL v9** : une « cible » d'anneaux concentriques dessinée en un seul dégradé radial (couleur cœur → bord → fondu noir) qui respire à ~60 fps. `Arduino_GFX` ne sert que de driver de flush bas niveau pour le GC9A01. La config LVGL est dans `include/lv_conf.h` (activée via `-DLV_CONF_INCLUDE_SIMPLE`).
 
+## Flasher sans rien installer (fichier .uf2)
+
+Le firmware compilé est fourni dans **`firmware/alba-firmware-1.1.0.uf2`** :
+
+1. Débrancher le Pico 2W, **maintenir BOOTSEL** et rebrancher l'USB.
+2. Relâcher : une clé USB **`RP2350`** apparaît.
+3. Y **glisser-déposer** le fichier `.uf2` — le Pico redémarre tout seul.
+
+Le WiFi déjà enregistré est conservé (le .uf2 ne remplace que le programme).
+
 ## Build & Flash (PlatformIO)
 
 Le firmware est en **C++ / Arduino** (core earlephilhower, **épinglé en 5.6.0** dans `platformio.ini` — l'AP+STA concurrent fiable nécessite arduino-pico ≥ 5.5.1) géré par **PlatformIO**.
