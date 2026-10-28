@@ -10,8 +10,13 @@
  *   - The ring colours form a gradient (bright core -> rim) sampled from the
  *     CO2 level; the breathing rate is also driven by the CO2 level.
  *
- * WiFi provisioning: open Access-Point + captive portal (inspired by
- *   ModuleAir_V4), credentials stored in flash (LittleFS).
+ * WiFi provisioning, two paths offered side by side while offline:
+ *   - Bluetooth LE "Improv WiFi" (ble_improv.cpp): the AirCarto app finds
+ *     "Alba-<token>", pushes the credentials and gets the token back, exactly
+ *     like a ModuleAir / ModuleAir mini.
+ *   - open Access-Point + captive portal (inspired by ModuleAir_V4), for anyone
+ *     without the app.
+ *   Credentials are stored in flash (LittleFS).
  *
  * Control flow is cooperative: a single non-blocking loop drives LVGL,
  * the web server, the CO2 sensor and the LED ring together.
@@ -31,6 +36,8 @@
 #include <DNSServer.h>
 #include <HTTPClient.h>       // POST measurements to the AirCarto endpoint
 #include <WiFiClientSecure.h> // TLS for the https:// data server
+
+#include "ble_improv.h" // WiFi provisioning from the AirCarto app (BLE)
 
 // ============================================================
 // PIN CONFIGURATION - Pico 2W
@@ -136,7 +143,7 @@ static uint8_t lvDrawBuf[SCREEN_W * SCREEN_H * (LV_COLOR_DEPTH / 8)]
 #define DATA_SERVER_URL "https://api.aircarto.fr/capteurs/alba.php"
 #define DATA_SEND_INTERVAL 60000UL // push a measurement every 60 s (ModuleAir)
 #define DATA_WARMUP_MS 15000UL     // first push ~15 s after (re)connect
-#define FIRMWARE_VERSION "1.0.0"   // reported as version_major.minor.patch
+#define FIRMWARE_VERSION "1.1.0"   // reported as version_major.minor.patch
 #define PROTOCOL_VERSION 1         // "version" field expected by the endpoint
 
 // --- WiFi connection state-machine timings (mirrors ModuleAir_V4) ----------
@@ -147,6 +154,9 @@ static uint8_t lvDrawBuf[SCREEN_W * SCREEN_H * (LV_COLOR_DEPTH / 8)]
 #define AP_RETRY_TIMEOUT_MS (30UL * 1000)        // one background reconnect try
 #define STA_RECONNECT_WINDOW_MS (3UL * 60 * 1000) // recover a dropped STA link
 #define STA_RECONNECT_KICK_MS (30UL * 1000)       // re-kick driver while recovering
+// Safety net for a join requested over BLE. The verdict itself comes from
+// ble_improv.cpp (20 s budget, under the app's 30 s wait).
+#define BLE_PROVISION_TIMEOUT_MS (45UL * 1000)
 
 // Device modes (drive the DISPLAY: splash / config screen / ppm)
 enum DeviceMode { MODE_STARTUP, MODE_CONFIG, MODE_NORMAL };
@@ -161,6 +171,7 @@ enum WifiState {
   WS_AP_CONFIG,        // AP up, screen shows "Config WiFi" (first 3 min)
   WS_AP_DATA,          // AP still up but screen shows ppm; retries every 10 min
   WS_AP_RETRYING,      // AP+STA: attempting a background reconnect (AP stays up)
+  WS_AP_PROVISIONING,  // AP+STA: joining the network the app sent over BLE
 };
 
 // ============================================================
@@ -197,6 +208,12 @@ WebServer server(WEB_PORT);
 DNSServer dnsServer;
 String cachedScanJson = "[]"; // networks scanned once before the AP comes up
 
+// Credentials sent by the app over BLE, kept aside until they PROVE they work:
+// only a successful join gets them written to flash, so a typo never replaces
+// the saved network.
+String bleSSID = "";
+String blePassword = "";
+
 // Device identity (derived from the WiFi MAC in setup()).
 //   deviceToken : printable serial, MAC-derived, also shown in the SSID
 //                 ("alba-<token>"); this is what gets registered server-side.
@@ -206,6 +223,9 @@ String cachedScanJson = "[]"; // networks scanned once before the AP comes up
 String deviceToken = "";
 String deviceIdHex = "";
 String deviceMac = "n/a";       // colon-formatted MAC, for the identity banner
+// BLE name the app looks for: "Alba-<token>". The app reads the product from
+// the prefix and the token from the trailing hex (services/improv-names.ts).
+String bleName = "";
 bool tokenFromChipId = false;   // true if the MAC was unavailable (fallback)
 unsigned long lastDataSend = 0; // millis() of the last upload attempt
 
@@ -232,8 +252,8 @@ void onCO2Updated();
 void setWifiState(WifiState s);
 void startWebServer();
 void apStart();
-void showNormalDisplay();
-void enterStaConnected();
+void showNormalDisplay(bool force = false);
+void enterStaConnected(bool forceDisplay = false);
 void startConfigMode();
 void attemptBackgroundReconnect();
 bool wifiSsidIsVisible(const String &ssid);
@@ -499,12 +519,14 @@ void setConfigUI() {
   applyTheme(s, e, 4500);
 
   lv_obj_remove_flag(glow, LV_OBJ_FLAG_HIDDEN); // breathing rings back on
-  // Small WiFi glyph crowning the config screen.
+  // WiFi + Bluetooth glyphs crowning the config screen: both ways in are open
+  // (the hotspot below, or the AirCarto app over Bluetooth).
   lv_anim_delete(lblIcon, NULL);
   lv_obj_set_style_opa(lblIcon, LV_OPA_COVER, 0);
   lv_obj_set_style_text_font(lblIcon, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(lblIcon, lv_color_white(), 0);
-  lv_label_set_text(lblIcon, LV_SYMBOL_WIFI);
+  lv_obj_set_style_transform_scale(lblIcon, 256, 0);
+  lv_label_set_text(lblIcon, LV_SYMBOL_WIFI "  " LV_SYMBOL_BLUETOOTH);
   lv_obj_align(lblIcon, LV_ALIGN_CENTER, 0, -66);
 
   lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_14, 0);
@@ -523,6 +545,20 @@ void setConfigUI() {
 
 void updateCO2Label() {
   lv_label_set_text(lblValue, String(co2Value).c_str());
+}
+
+void setNormalUI();
+void refreshNormal();
+
+// Put back the screen of the current display mode after a transient one (the
+// "Connexion a ..." / verdict screens of a BLE provisioning attempt).
+void restoreModeUI() {
+  if (currentMode == MODE_NORMAL) {
+    setNormalUI();
+    refreshNormal(); // re-apply the CO2 theme the connect screens overrode
+  } else if (currentMode == MODE_CONFIG) {
+    setConfigUI();
+  }
 }
 
 void setNormalUI() {
@@ -588,12 +624,14 @@ void updateLeds() {
 // ============================================================
 
 // Keep the UI alive (LVGL + LED ring) for ms milliseconds, so the connect
-// animations actually play during the otherwise-blocking connection flow.
+// animations actually play during the otherwise-blocking connection flow. The
+// BLE loop keeps running too: a verdict waiting to be notified must not stall.
 static void uiHold(uint32_t ms) {
   unsigned long t0 = millis();
   while (millis() - t0 < ms) {
     lv_timer_handler();
     updateLeds();
+    bleImprovLoop();
     delay(5);
   }
 }
@@ -944,29 +982,39 @@ function tog(){var p=document.getElementById('pw');p.type=p.type=='password'?'te
 scan();
 </script></body></html>)HTML";
 
-// Scan networks (must be in STA mode) and return them as a JSON array.
+// Scan networks (must be in STA mode) and return them as a JSON array. The
+// same scan is handed to the BLE module: the app gets its list from there, and
+// we never scan while an app is connected (the radio is shared with Bluetooth).
 String scanToJson() {
   int n = WiFi.scanNetworks();
   if (n < 0)
     n = 0;
+  if (n > 20)
+    n = 20;
 
+  String ssids[20];
+  BleImprovNet nets[20];
   String json = "[";
-  for (int i = 0; i < n && i < 20; i++) {
+  for (int i = 0; i < n; i++) {
+    ssids[i] = WiFi.SSID(i);
+    nets[i] = {ssids[i].c_str(), WiFi.RSSI(i),
+               WiFi.encryptionType(i) != ENC_TYPE_NONE};
     if (i > 0)
       json += ",";
     json += "{\"ssid\":\"";
-    String ssid = WiFi.SSID(i);
+    String ssid = ssids[i];
     ssid.replace("\\", "\\\\");
     ssid.replace("\"", "\\\"");
     json += ssid;
     json += "\",\"rssi\":";
-    json += String(WiFi.RSSI(i));
+    json += String(nets[i].rssi);
     json += ",\"encrypted\":";
-    json += (WiFi.encryptionType(i) != ENC_TYPE_NONE) ? "true" : "false";
+    json += nets[i].secure ? "true" : "false";
     json += "}";
   }
   json += "]";
 
+  bleImprovPushNetworks(nets, n); // copied: ssids[] may go out of scope
   WiFi.scanDelete();
   return json;
 }
@@ -1136,21 +1184,23 @@ void apStart() {
 }
 
 // Switch the DISPLAY to the live ppm readout. Idempotent: a no-op if already
-// showing it (used both when the config splash expires and when STA connects).
-void showNormalDisplay() {
-  if (currentMode == MODE_NORMAL)
+// showing it (used both when the config splash expires and when STA connects),
+// unless `force` -- a BLE provisioning screen may be covering it.
+void showNormalDisplay(bool force) {
+  if (currentMode == MODE_NORMAL && !force)
     return;
   currentMode = MODE_NORMAL;
   setNormalUI();
+  refreshNormal();
   lastCO2Request = millis();
 }
 
 // We are associated to a known network: serve the LAN status page and show ppm.
-void enterStaConnected() {
+void enterStaConnected(bool forceDisplay) {
   Serial.printf("[WiFi] STA connected, IP %s\n",
                 WiFi.localIP().toString().c_str());
   startWebServer();
-  showNormalDisplay();
+  showNormalDisplay(forceDisplay);
   // Schedule the first upload ~DATA_WARMUP_MS from now (not a full interval),
   // so a freshly (re)connected device reports quickly.
   lastDataSend = millis() - (DATA_SEND_INTERVAL - DATA_WARMUP_MS);
@@ -1161,9 +1211,25 @@ void enterStaConnected() {
 void startConfigMode() {
   Serial.println("Entering configuration mode (WiFi AP)...");
   apStart();
+  // Offline = visible to the app. After the AP's scan, so the BLE list is
+  // ready the moment someone connects.
+  bleImprovStart(bleName, deviceToken);
   currentMode = MODE_CONFIG;
   setConfigUI();
   setWifiState(WS_AP_CONFIG);
+}
+
+// The app sent credentials over BLE. Join WITHOUT dropping the hotspot
+// (concurrent AP+STA, as for the background reconnect): if the password is
+// wrong, the user retries from the app and the portal is still there.
+// ble_improv.cpp reads WiFi.status() to give the app its verdict.
+void onBleCredentials(const String &ssid, const String &password) {
+  Serial.printf("[WiFi] Joining '%s' (sent by the app)...\n", ssid.c_str());
+  bleSSID = ssid;
+  blePassword = password;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  setWifiState(WS_AP_PROVISIONING);
 }
 
 // Every 10 min while in AP-data mode, try to rejoin the saved network WITHOUT
@@ -1183,7 +1249,15 @@ void attemptBackgroundReconnect() {
 // True whenever the config hotspot is up (so the loop keeps serving DNS + web).
 bool isApActive() {
   return wifiState == WS_AP_CONFIG || wifiState == WS_AP_DATA ||
-         wifiState == WS_AP_RETRYING;
+         wifiState == WS_AP_RETRYING || wifiState == WS_AP_PROVISIONING;
+}
+
+// Leave the hotspot for STA-only operation once a join succeeded.
+static void tearDownAp() {
+  delay(300); // let any in-flight HTTP response flush over the AP
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
 }
 
 // The WiFi connection state machine, ticked at 1 Hz from loop(). This is the
@@ -1234,19 +1308,21 @@ void wifiManagerLoop() {
     break;
 
   case WS_AP_DATA:
-    // Every 10 min, attempt to rejoin the saved network in the background.
-    if (now - stateEnteredAt > AP_RETRY_INTERVAL_MS)
-      attemptBackgroundReconnect();
+    // Every 10 min, attempt to rejoin the saved network in the background --
+    // but never under the feet of someone configuring alba from the app.
+    if (now - stateEnteredAt > AP_RETRY_INTERVAL_MS) {
+      if (bleImprovClientConnected())
+        setWifiState(WS_AP_DATA); // re-arm, try again in 10 min
+      else
+        attemptBackgroundReconnect();
+    }
     break;
 
   case WS_AP_RETRYING:
     if (WiFi.status() == WL_CONNECTED) {
       // Joined: tear the hotspot down cleanly and go STA-only.
       Serial.println("[WiFi] Background reconnect SUCCEEDED -> tearing down AP");
-      delay(300); // let any in-flight HTTP response flush over the AP
-      dnsServer.stop();
-      WiFi.softAPdisconnect(true);
-      WiFi.mode(WIFI_STA);
+      tearDownAp();
       enterStaConnected();
     } else if (now - stateEnteredAt > AP_RETRY_TIMEOUT_MS) {
       // 30 s and still no association: drop the STA half, keep the AP, and
@@ -1256,6 +1332,70 @@ void wifiManagerLoop() {
       WiFi.mode(WIFI_AP);
       setWifiState(WS_AP_DATA);
     }
+    break;
+
+  case WS_AP_PROVISIONING: {
+    // ble_improv.cpp owns the verdict (and tells the app); we follow it.
+    const BleImprovUiState ble = bleImprovUiState();
+    if (ble == BLE_UI_SUCCESS) {
+      Serial.println("[WiFi] Network from the app joined -> saving, AP down");
+      saveWifiCredentials(bleSSID, blePassword);
+      storedSSID = bleSSID;
+      storedPassword = blePassword;
+      blePassword = "";
+      // Green check first: the verdict notifications keep flowing meanwhile
+      // (uiHold pumps the BLE loop). BLE itself stops once the app has had
+      // time to read it (bleImprovCanStop, see loop()).
+      showConnectResult(true, storedSSID);
+      tearDownAp();
+      enterStaConnected(true);
+    } else if (!bleImprovBusy() ||
+               now - stateEnteredAt > BLE_PROVISION_TIMEOUT_MS) {
+      // Wrong password / network gone: drop the STA half, keep the hotspot
+      // and BLE so the user can retry. The saved network is untouched.
+      Serial.println("[WiFi] Network from the app NOT joined -> back to AP");
+      blePassword = "";
+      WiFi.mode(WIFI_AP);
+      setWifiState(currentMode == MODE_NORMAL ? WS_AP_DATA : WS_AP_CONFIG);
+    }
+    break;
+  }
+  }
+}
+
+// Mirror a BLE provisioning attempt on screen. Called from loop(); the
+// verdict screen for a SUCCESS is shown by the FSM (WS_AP_PROVISIONING), which
+// also switches to the live display.
+void bleUiLoop() {
+  static BleImprovUiState shown = BLE_UI_OFF;
+  const BleImprovUiState s = bleImprovUiState();
+  if (s == shown)
+    return;
+  const BleImprovUiState prev = shown;
+  shown = s;
+
+  switch (s) {
+  case BLE_UI_LINKED:
+    // Someone is configuring alba from the app right now: say so (only on
+    // the config screen -- a ppm display keeps showing the ppm).
+    if (currentMode == MODE_CONFIG) {
+      lv_label_set_text(lblTitle, "Configuration par l'app");
+      lv_obj_align(lblTitle, LV_ALIGN_CENTER, 0, -30);
+    }
+    break;
+  case BLE_UI_CONNECTING:
+    setConnectingUI(String(bleImprovSsid()));
+    break;
+  case BLE_UI_FAILED:
+    showConnectResult(false, String(bleImprovSsid()));
+    restoreModeUI();
+    break;
+  case BLE_UI_ADVERTISING:
+    // The app left without configuring anything.
+    if (prev == BLE_UI_LINKED)
+      restoreModeUI();
+    break;
+  default:
     break;
   }
 }
@@ -1279,6 +1419,7 @@ void printIdentity() {
                 deviceToken.c_str());
   Serial.printf("  device_id  : %s\n", deviceIdHex.c_str());
   Serial.printf("  SSID AP    : %s\n", apSSID.c_str());
+  Serial.printf("  Nom BLE    : %s   (appli AirCarto)\n", bleName.c_str());
   Serial.println("==================================================");
   Serial.println();
 }
@@ -1561,7 +1702,9 @@ void setup() {
     tokenFromChipId = true;
   }
   apSSID = "alba-" + deviceToken;
+  bleName = "Alba-" + deviceToken;
   deviceIdHex = asciiToHex(deviceToken);
+  bleImprovOnCredentials(onBleCredentials);
   printIdentity();
 
   // --- LVGL ---
@@ -1605,7 +1748,13 @@ void loop() {
 #if !SKIP_WIFI
     // Drive the WiFi connection state machine (connect/scan/retry/AP/reconnect)
     // and serve the captive portal / status page for whichever links are up.
+    bleImprovLoop();
     wifiManagerLoop();
+    // Back online: stop advertising, once the app has had its verdict.
+    if (bleImprovRunning() && wifiState == WS_STA_CONNECTED &&
+        bleImprovCanStop())
+      bleImprovStop();
+    bleUiLoop();
     if (serverStarted) {
       if (isApActive())
         dnsServer.processNextRequest(); // captive portal only while the AP is up
@@ -1615,8 +1764,11 @@ void loop() {
 
     // Upload a measurement every DATA_SEND_INTERVAL while STA-connected. (In
     // AP-only mode there is no uplink, so nothing is sent.) The POST blocks for
-    // a few seconds, briefly pausing the animation -- fine once a minute.
-    if (WiFi.status() == WL_CONNECTED &&
+    // a few seconds, briefly pausing the animation -- fine once a minute. Never
+    // during a join (AP+STA states) nor while BLE still owes the app its
+    // verdict: a blocking TLS handshake there would starve the BLE loop.
+    if (wifiState == WS_STA_CONNECTED && WiFi.status() == WL_CONNECTED &&
+        !bleImprovRunning() &&
         millis() - lastDataSend >= DATA_SEND_INTERVAL) {
       lastDataSend = millis();
       dataSenderSend();

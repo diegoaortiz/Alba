@@ -1,6 +1,6 @@
 # Alba — CO2 Display (Pico 2W + MH-Z19B + GC9A01)
 
-Capteur CO2 connecté « **alba** » : affichage animé (anneaux concentriques qui « respirent ») sur écran rond 1.28" (240x240), anneau LED WS2812 synchronisé, provisioning WiFi par portail captif, et envoi des mesures vers l'API AirCarto.
+Capteur CO2 connecté « **alba** » : affichage animé (anneaux concentriques qui « respirent ») sur écran rond 1.28" (240x240), anneau LED WS2812 synchronisé, provisioning WiFi **depuis l'app AirCarto (Bluetooth)** ou par portail captif, et envoi des mesures vers l'API AirCarto.
 
 ## Schematic
 
@@ -11,7 +11,7 @@ Capteur CO2 connecté « **alba** » : affichage animé (anneaux concentriques q
 - **Board** : Raspberry Pi Pico 2W
 - **Display** : GC9A01 240x240 round LCD
 - **Sensor** : MH-Z19B CO2 sensor
-- **LEDs** : anneau WS2812 (24 LEDs)
+- **LEDs** : anneau WS2812 (64 LEDs)
 
 ## Wiring
 
@@ -39,7 +39,7 @@ Capteur CO2 connecté « **alba** » : affichage animé (anneaux concentriques q
 
 > Le MH-Z19B est câblé **croisé** : TX du capteur → GP7 (RX du Pico), RX du capteur → GP6 (TX du Pico). GP6/GP7 ne sont pas sur un UART matériel, le firmware utilise un port série émulé par PIO (`SerialPIO`).
 
-> L'anneau LED est piloté par **WS2812FX** (mode custom « breathing » synchronisé avec la respiration de l'écran). Ajuster `LED_COUNT` dans `src/main.cpp` si l'anneau n'a pas 24 LEDs.
+> L'anneau LED est piloté par **WS2812FX** (mode custom « breathing » synchronisé avec la respiration de l'écran). Ajuster `LED_COUNT` dans `src/main.cpp` si l'anneau n'a pas 64 LEDs.
 
 > L'affichage est rendu avec **LVGL v9** : une « cible » d'anneaux concentriques dessinée en un seul dégradé radial (couleur cœur → bord → fondu noir) qui respire à ~60 fps. `Arduino_GFX` ne sert que de driver de flush bas niveau pour le GC9A01. La config LVGL est dans `include/lv_conf.h` (activée via `-DLV_CONF_INCLUDE_SIMPLE`).
 
@@ -60,11 +60,23 @@ pio device monitor
 
 Pour le tout premier flash : maintenir **BOOTSEL**, brancher l'USB, relâcher quand le lecteur **RPI-RP2** apparaît, puis `pio run -t upload`.
 
-> Les anciens fichiers MicroPython (`main.py`, `code.py`, etc.) sont obsolètes : le firmware actif est `src/main.cpp`.
+> Les anciens fichiers MicroPython (`micropython/main.py`, `micropython/code.py`, etc.) sont obsolètes : le firmware actif est `src/main.cpp`.
+
+## Configuration WiFi depuis l'app AirCarto (Bluetooth)
+
+Tant qu'il n'est pas connecté (mode configuration), alba s'annonce en Bluetooth LE sous le nom **`Alba-<TOKEN>`** (ex : `Alba-88A29E0CEFF3`), avec le service **Improv WiFi** — exactement le protocole des ModuleAir / ModuleAir mini (`src/ble_improv.cpp`, mêmes UUID, mêmes octets).
+
+1. Dans l'app : **Ajouter un capteur** → alba apparaît dans « Capteurs détectés » (icône CO₂, « Alba · WiFi à configurer »).
+2. Choisir le réseau (liste scannée par alba), saisir le mot de passe, **Connecter**. L'écran d'alba affiche « Connexion a … » puis la coche verte.
+3. alba renvoie son **token** à l'app, qui retrouve le capteur côté serveur (`getPublicName.php` → `alba-001`) et l'ajoute au tableau de bord.
+
+Les identifiants ne sont écrits en flash **qu'après une connexion réussie** : un mot de passe erroné laisse le réseau enregistré intact, et l'app peut réessayer sans rien couper (le hotspot reste actif pendant la tentative, en AP+STA). Une fois en ligne, alba cesse d'annoncer (après ~8 s, le temps que l'app lise le verdict). S'il perd son réseau et retombe en mode configuration, il réapparaît dans l'app, qui propose « Reconfigurer le WiFi ».
+
+> Le capteur doit être **enregistré côté serveur** (`capteurs.capteurs`, type `Alba`, `token` = MAC affichée au boot — touche `i` dans le moniteur série) pour que l'app récupère son nom et ses données.
 
 ## Configuration WiFi (portail captif)
 
-À la première mise sous tension (ou après un reset), si aucun identifiant WiFi n'est enregistré, l'appareil démarre un **point d'accès ouvert** et un **portail captif** :
+Alternative sans l'app : à la première mise sous tension (ou après un reset), si aucun identifiant WiFi n'est enregistré, l'appareil démarre aussi un **point d'accès ouvert** et un **portail captif** :
 
 1. L'écran affiche `Config WiFi`, le nom du réseau (`alba-XXXXXX`) et l'IP (`192.168.4.1`).
 2. Sur un téléphone/PC, rejoindre le réseau WiFi **`alba-XXXXXX`** (ouvert, sans mot de passe).
